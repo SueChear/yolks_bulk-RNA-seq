@@ -1,0 +1,511 @@
+---
+title: ""
+author: "SChear"
+date: "2024-03-19"
+output: html_document
+---
+### Comparing data between human yolk sac, ipsc-derived yolk sac and yolk sac organoids. 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+
+
+
+```{r,results='hide',fig.keep='all', warning=FALSE,message=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+library(ComplexHeatmap)
+library(clusterProfiler)
+library(EnhancedVolcano)
+library(fgsea)
+library(magrittr)
+library(tidyverse)
+library(vsn)
+library(pheatmap)
+library(RColorBrewer)
+library(edgeR)
+library(matrixStats)
+library(circlize)
+library(tximport)
+library(ggvenn)
+library(grid)
+library(ggplot2)
+library(enrichR)
+
+```
+
+Samples used in this analysis:
+
+```{r}
+df<-data.frame("Abbreviation"=c("YSO_D6","YSO_D13","HYS","iYS_D16"),
+               "Sample"=c("iPSC-derived yolk sac-like organoid at day 6",
+                          "iPSC-derived yolk sac-like organoid at day 13","Human yolk sac","iYolk sac"),
+               "Source"=c("PRJNA660253","PRJNA660253","PRJEB18767 ","Da's culture"), "Replicates"=c(3,3,9,3))
+print(df)
+```
+
+
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+
+counts<-read.csv("mergedYS.csv",header=T, sep=",")
+counts<-na.omit(counts)
+row.names(counts) <- counts$Geneid
+counts <- counts[, -1]
+```
+
+
+```{r,fig.keep='all', warning=FALSE,message=FALSE}
+condition<-factor(c("YSO_D6","YSO_D6","YSO_D6","YSO_D13","YSO_D13","YSO_D13",
+                    "iYS_D16","iYS_D16","iYS_D16","HYS","HYS","HYS","HYS","HYS","HYS","HYS","HYS","HYS"))
+
+sample<-factor(colnames(counts))
+
+coldata<-data.frame(sample,condition)
+
+dds<-DESeqDataSetFromMatrix(countData = counts,
+                             colData = coldata,
+                             design=~condition)
+
+dds
+```
+
+We retain genes with at least 1 count per million (CPM) in at least two samples.
+Genes remained after filtering: 20,220
+```{r,fig.keep='all', warning=FALSE,message=FALSE}
+dds = dds[ rowSums(edgeR::cpm(counts(dds)) > 1)>=2, ]
+
+nrow(dds)
+```
+
+QC for dispersion of variability in data. 
+```{r, results='hide',fig.keep='all', warning=FALSE,message=FALSE}
+dds <- estimateSizeFactors(dds)
+dds <- estimateDispersions(dds)
+plotDispEsts(dds)
+```
+
+Transform data using VST method before PCA. 
+```{r, results='hide', warning=FALSE,message=FALSE}
+vst2<-vst(dds,blind=F)
+
+meanSdPlot(assay(vst2), ranks=FALSE)
+```
+
+PCA: to examine variation between samples. 
+```{r,results='hide', warning=FALSE,message=FALSE}
+
+# Plot PCA
+
+z<-plotPCA(vst2, intgroup = "condition")
+# Generate the PCA coordinates
+pca_data <- plotPCA(vst2, intgroup = "condition")$data
+
+# Create the PCA plot using ggplot2
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha=0.5) +  
+  # Adjust the size as needed
+  labs(title = "PCA Plot", x = "PC1", y = "PC2")
+```
+
+
+
+```{r}
+ntop <- 500
+rv <- rowVars(assay(vst2))
+select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+mat <- t( assay(vst2)[select, ] )
+
+pca<-prcomp(mat)
+pca <- as.data.frame(pca$x)
+
+```
+
+
+
+```{r, eval=FALSE}
+getLoadings = function(dds){
+  
+  mat<-assay(vst2)
+  pca = prcomp(t(mat), retx = TRUE)
+  
+  return(pca$rotation)
+}
+
+loadings_vst2 = getLoadings(vst2data) %>% as.data.frame()
+# Annotating gene names
+loadings_vst2$symbol = mapIds(org.Hs.eg.db,
+                              keys=rownames(loadings_vst2),
+                              column="SYMBOL",
+                              keytype="ENSEMBL",
+                              multiVals="first")
+
+# show the top 50 genes from PC1
+loadings_vst2 %>% 
+  # select only the PCs we are interested in
+  dplyr::select(symbol, PC1) %>%
+  # convert to "long" format
+  pivot_longer(cols = "PC1", names_to = "PC1", values_to = "loadings") %>% 
+  # for PC1
+  group_by(PC1) %>% 
+  # arrange by descending order
+  arrange(desc(abs(loadings))) %>% 
+  # take the 10 top rows
+  slice(1:50) %>%
+  pull(symbol)
+
+```
+
+
+
+```{r, eval=FALSE}
+
+# show the top 20 genes from PC2
+loadings_vst2 %>% 
+  # select only the PCs we are interested in
+  dplyr::select(symbol, PC2) %>%
+  # convert to "long" format
+  pivot_longer(cols = "PC2", names_to = "PC2", values_to = "loadings") %>% 
+  # for PC2
+  group_by(PC2) %>% 
+  # arrange by descending order
+  arrange(desc(abs(loadings))) %>% 
+  # take the 10 top rows
+  slice(1:50) %>%
+  pull(symbol)
+```
+
+
+Cluster dendrogram: 
+```{r,results='hide', fig.keep='all',warning=FALSE,message=FALSE}
+rv <- rowVars(assay(vst2))
+o <- order(rv,decreasing=TRUE)
+dists <- dist(t(assay(vst2)[head(o,500),]))
+hc <- hclust(dists)
+plot(hc, labels=vst2$sample)
+```
+
+
+Correlation matrix heat map of transcript expression across all samples. 
+
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+
+sampleDists<-dist(t(assay(vst2)))
+sampleDistMatrix<-as.matrix(sampleDists)
+colnames(sampleDistMatrix)
+
+colors<-colorRampPalette(rev(brewer.pal(6,"Blues")))(255)
+
+pheatmap(sampleDistMatrix, clustering_distance_rows = sampleDists, display_numbers = TRUE,
+         clustering_distance_cols=sampleDists, col=colors, fontsize_number=10,cellnote = mat,cellnote_fontface = "bold")
+```
+
+
+
+
+## Heatmap to visualize clustering using top 100 genes. 
+```{r,fig.keep='all', results='hide',warning=FALSE,message=FALSE}
+#get the indices of the top variable genes
+topVarGenes <- head(order(rowVars(assay(vst2)), decreasing = TRUE), 100)
+
+#subset the data matrix to include only the top variable genes
+mat  <- assay(vst2)[ topVarGenes, ]
+
+
+#center the data
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vst2))
+
+#map ensembl IDs to gene symbols
+symbols <- mapIds(org.Hs.eg.db, keys = rownames(mat), column = "SYMBOL", keytype = "ENSEMBL")
+
+symbols <- symbols[!is.na(symbols)]
+  symbols <- symbols[match(rownames(mat), names(symbols))]
+  rownames(mat) <- symbols
+  keep <- !is.na(rownames(mat))
+  mat <- mat[keep,]
+
+
+#create a heatmap with hierarchical clustering
+#heatmap_result <- pheatmap(mat, annotation_col = anno, fontsize_row=5)
+
+
+```
+
+
+```{r,fig.keep='all', results='hide',fig.width=10, fig.height=10,warning=FALSE,message=FALSE}
+# Perform hierarchical clustering separately
+hc_rows <- hclust(dist(mat), method = "complete")
+
+# Create a heatmap with hierarchical clustering
+#heatmap_result <- pheatmap(mat, annotation_col = anno, fontsize_row = 5, clustering_distance_rows = "correlation")
+
+heatmap_result <- pheatmap(mat, fontsize_row = 5, clustering_distance_rows = "correlation")
+# Extract the cluster assignments for the rows
+cluster_assignments <- cutree(hc_rows, k = 2)
+
+# Print or use the cluster assignments as needed
+print(cluster_assignments)
+
+# Create a data frame with gene symbols and cluster assignments
+gene_cluster_df <- data.frame(
+  GeneSymbol = names(cluster_assignments),
+  ClusterAssignment = cluster_assignments
+)
+
+# Order the data frame by cluster assignments
+gene_cluster_df <- gene_cluster_df[order(gene_cluster_df$ClusterAssignment, gene_cluster_df$GeneSymbol), ]
+
+# Print or use the data frame as needed
+print(gene_cluster_df)
+
+write.csv(gene_cluster_df, "genecluster.csv",row.names=F)
+```
+
+Pathways enriched in cluster 1 :these are genes upregulated in human yolk sac.
+```{r,fig.keep='all', results='hide', fig.width=10, fig.height=10,warning=FALSE,message=FALSE}
+# Select genes in Cluster 1
+genes_in_cluster1 <- gene_cluster_df$GeneSymbol[gene_cluster_df$ClusterAssignment == 1]
+
+print(genes_in_cluster1)
+
+entrez_ids <- mapIds(org.Hs.eg.db, keys = genes_in_cluster1, keytype = "SYMBOL", column = "ENTREZID")
+
+GO_results <- enrichGO(gene = genes_in_cluster1, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP")
+
+as.data.frame(GO_results)
+
+
+plot(barplot(GO_results, showCategory = 15,cex.names = 0.5))
+```
+
+Pathways enriched in cluster 2; these are genes upregulated in yolk sac organoids.
+```{r,fig.keep='all', results='hide',fig.width=10, fig.height=10,warning=FALSE,message=FALSE}
+# Select genes in Cluster 2
+genes_in_cluster2 <- gene_cluster_df$GeneSymbol[gene_cluster_df$ClusterAssignment == 2]
+
+print(genes_in_cluster2)
+
+entrez_ids <- mapIds(org.Hs.eg.db, keys = genes_in_cluster2, keytype = "SYMBOL", column = "ENTREZID")
+
+GO_results2 <- enrichGO(gene = genes_in_cluster2, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP")
+
+as.data.frame(GO_results2)
+
+
+plot(barplot(GO_results2, showCategory = 15,cex.names = 0.5))
+```
+
+
+```{r,eval=FALSE}
+# Select genes in Cluster 3
+#genes_in_cluster3 <- gene_cluster_df$GeneSymbol[gene_cluster_df$ClusterAssignment == 3]
+
+#print(genes_in_cluster3)
+
+#entrez_ids <- mapIds(org.Hs.eg.db, keys = genes_in_cluster3, keytype = "SYMBOL", column = "ENTREZID")
+
+#GO_results3 <- enrichGO(gene = genes_in_cluster3, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP")
+
+#as.data.frame(GO_results3)
+
+#plot(barplot(GO_results3,cex.names = 0.5))
+```
+
+```{r,eval=FALSE}
+#combine gene cluster list into dataframe
+cluster_list<-list(genes_in_cluster1,genes_in_cluster2,genes_in_cluster3)
+
+cluster1<-as.data.frame(genes_in_cluster1)%>%mutate(cluster=1)%>%rename(genes = genes_in_cluster1)
+cluster2<-as.data.frame(genes_in_cluster2)%>%mutate(cluster=2)%>%rename(genes = genes_in_cluster2)
+cluster3<-as.data.frame(genes_in_cluster3)%>%mutate(cluster=3)%>%rename(genes = genes_in_cluster3)
+
+combined_cluster<-rbind(cluster1,cluster2,cluster3)
+
+write.csv(combined_cluster, "combined_cluster2.csv",row.names=F,sep='\t')
+```
+
+
+
+### Differential expression of gene analysis:  
+### HYS vs iYS. (padjusted value=0.05)
+
+```{r,fig.keep='all', warning=FALSE,message=FALSE}
+pds<-dds
+
+pds$condition<-relevel(pds$condition, ref="iYS_D16")
+
+pds<-DESeq(pds)
+
+res = results(pds, contrast=c("condition","HYS","iYS_D16"), alpha=0.05)
+
+summary(res)
+
+```
+
+
+```{r,fig.keep='all', results='hide',warning=FALSE,message=FALSE}
+sigs<-na.omit(res)
+
+sigs.df<-as.data.frame(sigs)
+
+columns(org.Hs.eg.db)
+
+sigs.df$symbol<-mapIds(org.Hs.eg.db, keys=rownames(sigs.df), keytype = "ENSEMBL",column="SYMBOL")
+
+sigs.df<-sigs.df%>%filter(!str_detect(symbol,'NA'))
+
+
+```
+
+
+Retrieve gene ontology terms associated with upregulated genes in HYS samples
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+genes_to_test <- rownames(sigs[sigs$log2FoldChange >5,])
+
+GO_results <- enrichGO(gene = genes_to_test, OrgDb = "org.Hs.eg.db", keyType = "ENSEMBL", ont = "BP")
+
+as.data.frame(GO_results)
+
+
+plot(barplot(GO_results, showCategory = 15))
+```
+
+Retrieve gene ontology terms associated with downregulated genes in HYS samples
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+genes_to_test <- rownames(sigs[sigs$log2FoldChange < -2,])
+
+GO_results <- enrichGO(gene = genes_to_test, OrgDb = "org.Hs.eg.db", keyType = "ENSEMBL", ont = "BP")
+
+as.data.frame(GO_results)
+
+
+plot(barplot(GO_results, showCategory = 15))
+```
+
+
+### YSO_D13 vs HYS. (padjusted value=0.05)
+
+```{r,fig.keep='all', warning=FALSE,message=FALSE}
+pds<-dds
+
+pds$condition<-relevel(pds$condition, ref="HYS")
+
+pds<-DESeq(pds)
+
+res = results(pds, contrast=c("condition","YSO_D13","HYS"), alpha=0.05)
+
+summary(res)
+
+```
+
+
+```{r,fig.keep='all', results='hide',warning=FALSE,message=FALSE}
+sigs<-na.omit(res)
+
+sigs.df<-as.data.frame(sigs)
+
+columns(org.Hs.eg.db)
+
+sigs.df$symbol<-mapIds(org.Hs.eg.db, keys=rownames(sigs.df), keytype = "ENSEMBL",column="SYMBOL")
+
+sigs.df<-sigs.df%>%filter(!str_detect(symbol,'NA'))
+
+
+```
+
+
+Retrieve gene ontology terms associated with upregulated genes in YSO_D13 samples
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+genes_to_test <- rownames(sigs[sigs$log2FoldChange >5,])
+
+GO_results <- enrichGO(gene = genes_to_test, OrgDb = "org.Hs.eg.db", keyType = "ENSEMBL", ont = "BP")
+
+as.data.frame(GO_results)
+
+
+plot(barplot(GO_results, showCategory = 15))
+```
+
+Retrieve gene ontology terms associated with downregulated genes in YSO_D13 samples
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+genes_to_test <- rownames(sigs[sigs$log2FoldChange < -2,])
+
+GO_results <- enrichGO(gene = genes_to_test, OrgDb = "org.Hs.eg.db", keyType = "ENSEMBL", ont = "BP")
+
+as.data.frame(GO_results)
+
+
+plot(barplot(GO_results, showCategory = 15))
+```
+
+
+
+
+
+### Heatmap expression of various cell marker genes
+```{r, eval=FALSE, message=FALSE}
+# Extract the transformed data matrix
+transformed_matrix <- assay(vst2)
+
+# Convert the matrix to a data frame
+transformed_df <- as.data.frame(transformed_matrix)
+
+# Extract row names (Ensembl IDs)
+ensembl_ids <- rownames(transformed_df)
+
+# Map Ensembl IDs to gene symbols using org.Hs.eg.db
+symbols <- mapIds(org.Hs.eg.db, keys = ensembl_ids, column = "SYMBOL", keytype = "ENSEMBL")
+
+# Add gene symbols as a new column to the data frame
+transformed_df$Symbol <- symbols[match(ensembl_ids, names(symbols))]
+
+# Remove the initial row names
+rownames(transformed_df) <- NULL
+
+#save as csv
+write.csv(transformed_df, "forheatmap.csv",row.names=F,sep='\t')
+```
+
+```{r, results='hide',fig.keep='all', fig.width=10, fig.height=10, warning=FALSE,message=FALSE}
+df<-read.delim("forheatmap.csv",header=T, sep=",")
+head(df)
+
+
+df2<-df%>%filter(Symbol%in% c("TMEM119","P2RY12","HEXB","FCRLS","SALL1","C1Q","GPR34","OLFML3","MERTK",
+  "PROS1","TYRO3","TGFBR1","CD31","NG2","PDGFRB","CD146","NESTIN","VWF",
+  "ACE","ADAMTS13","PECAM1","VCAM1","ICAM1","ICAM2","CD47","SELE","SLP",
+  "CDH5","NECTIN2","ESAM","LEF1","FZD3","NOTUM","APCDD1","AXIN2","DIXDC1",
+  "TNFRSF19")) 
+
+head(df2)
+
+df3 <- df2 %>% 
+  column_to_rownames(var = "Symbol")
+
+#set a color scheme
+#colors<-colorRampPalette(rev(brewer.pal(9,"Blues")))(255)
+
+pheatmap(df3, scale="row",display_numbers=TRUE,fontsize_number=7,color = colorRampPalette(rev(c("#D73027", "#FC8D59", 
+	    "#FEE090", "#FFFFBF", "#E0F3F8", "#91BFDB", "#4575B4")))(100))
+
+pheatmap(df3, cluster_cols=FALSE,  display_numbers=TRUE,fontsize_number=7,
+          color = colorRampPalette(rev(c("#D73027", "#FC8D59", 
+	    "#FEE090", "#FFFFBF", "#E0F3F8", "#91BFDB", "#4575B4")))(100))
+
+pheatmap(df3, cluster_cols=FALSE, cluster_rows = FALSE, display_numbers=TRUE,fontsize_number=7,
+          color = colorRampPalette(rev(c("#D73027", "#FC8D59", 
+	    "#FEE090", "#FFFFBF", "#E0F3F8", "#91BFDB", "#4575B4")))(100))
+
+
+
+```
+
+
+
+
+
